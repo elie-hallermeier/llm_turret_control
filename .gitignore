@@ -218,3 +218,6 @@ models/
 
 ggml-tiny.en.bin
 ggml-base.en.bin
+
+speech.wav
+speech.wav.txt
