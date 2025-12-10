@@ -1,224 +1,271 @@
 """
-Simple demo: control 2 simulated servos(pan,tilt) with a local LLM.
+Voice-controlled servo simulator using Whisper.cpp for speech-to-text
+and a local LLM (Ollama) for command interpretation.
 
-REQUIREMENT:
-    pip install ollama
+Requirements:
+    pip install sounddevice numpy ollama
+    brew install whisper-cpp
     ollama pull gemma3
     ollama serve
-"""
-import time
 
+Download Whisper tiny model:
+    ggml-tiny.en.bin
+"""
+
+import time
 import json
 import re
-import time
+import os
+import wave
+import sounddevice as sd
+import numpy as np
+from scipy.signal import resample
 from typing import Dict, Optional
 
 from ollama import chat
 
-import sounddevice as sd
-from vosk import Model, KaldiRecognizer
-
-# ------ CONFIG -----
+# ---------------- CONFIG -------------------
 
 MODEL_NAME = "gemma3:1b"
 
-MIN_ANGLE = 0.0
-MAX_ANGLE = 180.0
+WHISPER_MODEL_PATH = "ggml-tiny.en.bin"
+TEMP_WAV_PATH = "speech.wav"
+SAMPLE_RATE = 16000
 
-START_PAN = 90.0
-START_TILT = 90.0
+MIN_ANGLE = 0
+MAX_ANGLE = 180
+
+START_PAN = 90
+START_TILT = 90
 
 SIMULATION_SECONDS = 5
 
-# Speech-to-text config
-STT_SAMPLE_RATE = 16000
-STT_MODEL_PATH = "models/vosk-model-small-en-us-0.15"  # change if you put it somewhere else
-
-# HELPERS
+# ---------------- HELPERS -------------------
 
 def clamp(value: float, low: float, high: float) -> float:
-    return max(low, (min(value, high)))
+    return max(low, min(value, high))
 
 
 def extract_json(text: str) -> Dict:
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        raise ValueError("No JSON object found in the LLM reponse")
+        raise ValueError("No JSON object found in LLM response")
 
-    json_str = match.group(0)
-    return json.loads(json_str)
-
-
-def validate_servo_plan(data:Dict) -> Dict:
-    # Ensure the JSON has the fields we expect and the correct types.
-    fields_set = {"pan_delta_deg", "tilt_delta_deg"}
-    if not fields_set.issubset(data):
-        raise ValueError("Missing one of the JSON fields")
-
-    pan_delta = float(data["pan_delta_deg"])
-    tilt_delta = float(data["tilt_delta_deg"])
-
-    max_delta = 45
-
-    pan_delta = clamp(pan_delta, -max_delta, max_delta)
-    tilt_delta = clamp(tilt_delta, -max_delta, max_delta)
-
-    return{
-        "pan_delta_deg": pan_delta,
-        "tilt_delta_deg": tilt_delta
-    }
+    return json.loads(match.group(0))
 
 
-def get_servo_plan_from_llm(user_instructions: str) -> Optional[Dict]:
-    """Send the text from the user to the LLM and get a movement plan
-    The system prompt forces the model to answer only with a JSON"""
-
-    system_prompt = (
-        "You control a 2 axis turret with 'pan' and 'tilt' angles.\n"
-        "The user gives natural commands about how to move it.\n\n"
-        "You must respond with only a JSON object and nothing else.\n"
-        "Format exactly:\n"
-        "{\n"
-        '   "pan_delta_deg": <number>,\n'
-        '   "tilt_delta_deg": <number>,\n'
-        "}\n\n"
-        "Meaning:\n"
-        " - pan_delta_deg: positive = move right, negative = move left.\n"
-        " - tilt_delta_deg: positive = move up, negative = move down.\n"
-        " - Each Value is in degree, keep value between 45 and -45."
-    )
-
-    print("Sending Prompt to LLM")
-
-    response = chat(
-        model=MODEL_NAME,
-        messages=[
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_instructions},
-    ],
-    )
-
-    print("Response Received from LLM")
-
-    raw_text = response.message.content
-
-    print("LLM raw output", raw_text)
-
-    try:
-        data = extract_json(raw_text)
-        plan = validate_servo_plan(data)
-        return plan
-    except Exception as exc:
-        print(f"[ERROR] Could not parse LLM output as valid plan: {exc}")
-        return None
-
-
-def simulate_servo_motion(
-        current_pan: float,
-        current_tilt: float,
-        target_pan: float,
-        target_tilt: float,
-        seconds: int = SIMULATION_SECONDS,
-) -> (float, float):
-
-    steps = max(1, seconds)
-    step_pan = (target_pan - current_pan) / steps
-    step_tilt = (target_tilt - current_tilt) / steps
-
-    print(f"Pan angle: {current_pan}")
-    print(f"Tilt angle: {current_tilt}")
-    time.sleep(1)
-
-    print("Simulating movement")
-    for i in range(seconds):
-        current_pan += step_pan
-        current_tilt += step_tilt
-        print(f"Pan angle: {current_pan}")
-        print(f"Tilt angle: {current_tilt}")
-
-        time.sleep(1)
-
-    return current_pan, current_tilt
-
-
-def load_stt_model() -> Model:
-    """Load the offline Vosk speech model once."""
-    print("Loading STT model...")
-    model = Model(STT_MODEL_PATH)
-    print("STT model loaded.")
-    return model
-
-
-def recognize_speech_ptt(model: Model) -> str:
-    """
-    Press ENTER to start recording.
-    Speak freely.
-    Press ENTER again to stop and process speech.
-    """
-    input("\nPress ENTER to START speaking...")
+def record_audio() -> str:
+    """Push-to-talk recording and saving to WAV at 16 kHz."""
+    input("\nPress ENTER to START recording...")
     print("Recording... Press ENTER to STOP.")
 
-    recorded_chunks = []
+    chunks = []
+    device_rate = int(sd.query_devices(kind="input")["default_samplerate"])
 
-    def callback(indata, frames, time_info, status):
-        if status:
-            print(status)
-        recorded_chunks.append(indata.copy())
+    def callback(indata, frames, t, status):
+        chunks.append(indata.copy())
 
     with sd.InputStream(
-        samplerate=STT_SAMPLE_RATE,
+        samplerate=device_rate,
         channels=1,
         dtype="int16",
-        callback=callback,
+        callback=callback
     ):
-        input()  # Wait for ENTER to stop
+        input()
 
-    print("Recording stopped. Processing...")
+    print("Recording stopped.")
 
-    audio_data = b"".join(chunk.tobytes() for chunk in recorded_chunks)
+    audio = np.concatenate(chunks, axis=0)
+    target_len = int(len(audio) * SAMPLE_RATE / device_rate)
+    audio_resampled = resample(audio, target_len).astype(np.int16)
 
-    recognizer = KaldiRecognizer(model, STT_SAMPLE_RATE)
-    recognizer.AcceptWaveform(audio_data)
-    result_json = recognizer.Result()
-    result_data = json.loads(result_json)
+    with wave.open(TEMP_WAV_PATH, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio_resampled.tobytes())
 
-    text = result_data.get("text", "").strip()
+    return TEMP_WAV_PATH
 
-    if text:
-        print(f"Recognized: '{text}'")
-    else:
-        print("Did not recognize any speech.")
+
+def run_whisper(audio_path: str) -> str:
+    """Runs Whisper.cpp tiny model in CPU-only mode."""
+    txt_path = audio_path + ".txt"
+
+    # Remove old file if exists
+    if os.path.exists(txt_path):
+        os.remove(txt_path)
+
+    cmd = (
+        f"whisper-cli "
+        f"-m {WHISPER_MODEL_PATH} "
+        f"-f {audio_path} "
+        f"-ng "
+        f"-otxt"
+    )
+
+    os.system(cmd)
+
+    # Whisper writes to audio.wav.txt
+    if not os.path.exists(txt_path):
+        print("Whisper output file missing:", txt_path)
+        return ""
+
+    with open(txt_path, "r") as f:
+        text = f.read().strip()
 
     return text
 
 
-def main() -> None:
+# ---------------- LLM COMMAND PARSER -------------------
+
+def get_servo_plan_from_llm(text: str, pan: float, tilt: float) -> Optional[Dict]:
+    """
+    Ask the LLM to turn a natural language command + current servo state
+    into a JSON movement plan.
+    """
+
+    system_prompt = """
+You control a 2-axis servo turret: pan and tilt.
+
+Your job:
+- Read the user's command.
+- Look at the current pan and tilt angles.
+- Decide how the turret should move.
+- Output a JSON object ONLY.
+
+JSON format:
+{
+  "mode": "delta" or "absolute",
+  "pan": <number>,
+  "tilt": <number>
+}
+
+Meanings:
+- mode = "delta": move by that amount relative to current angles.
+- mode = "absolute": go directly to those angles.
+- pan: positive = right, negative = left.
+- tilt: positive = up, negative = down.
+
+Physical limits:
+- pan angle range: 0 to 180 degrees.
+- tilt angle range: 0 to 180 degrees.
+- You must choose values that respect these limits.
+- Reasonable delta moves are usually much smaller than the full range:
+  do not use huge deltas unless the user clearly asks for "all the way" or "as far as possible".
+
+High-level behavior (not rigid rules):
+- "a little", "slightly", "a bit" → small movement.
+- "a lot", "far", "strong" → large movement.
+- The closer you are to the limit, the smaller the movement should be in that direction.
+- If the user only talks about left/right, you should normally keep tilt unchanged (tilt = 0 in delta mode).
+- If the user only talks about up/down, you should normally keep pan unchanged (pan = 0 in delta mode).
+
+You must:
+- Use the current pan and tilt values that are provided to you.
+- Choose numeric values that are reasonable and proportional to the wording and current state.
+- Never move both axes if the user clearly referred to only one axis.
+- Never output angles or deltas that would send the turret outside [0, 180].
+
+Output:
+- Valid JSON only.
+- No backticks.
+- No explanations.
+"""
+
+    # Pack current state + command as a simple text block
+    user_content = (
+        f"Current state:\n"
+        f"- pan: {pan} degrees\n"
+        f"- tilt: {tilt} degrees\n\n"
+        f"User command:\n"
+        f"{text}\n"
+    )
+
+    print("Sending text to LLM...")
+
+    response = chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    )
+
+    raw = response.message.content
+    print("LLM raw output:", raw)
+
+    try:
+        plan = extract_json(raw)
+        return plan
+    except Exception as e:
+        print("LLM output parse error:", e)
+        return None
+
+
+# ---------------- SERVO SIMULATION -------------------
+
+def simulate_motion(pan, tilt, pan_target, tilt_target):
+    steps = max(1, SIMULATION_SECONDS)
+    d_pan = (pan_target - pan) / steps
+    d_tilt = (tilt_target - tilt) / steps
+
+    print(f"Start pan={pan}, tilt={tilt}")
+    print("Simulating movement...")
+
+    for i in range(steps):
+        pan += d_pan
+        tilt += d_tilt
+        print(f"Pan={pan:.1f}, Tilt={tilt:.1f}")
+        time.sleep(1)
+
+    return pan, tilt
+
+
+# ---------------- MAIN -------------------
+
+def main():
     pan = START_PAN
     tilt = START_TILT
 
-    stt_model = load_stt_model()
+    print("=== Voice-controlled LLM Servo System ===")
 
-    user_input= recognize_speech_ptt(stt_model)
+    while True:
+        wav = record_audio()
+        text = run_whisper(wav)
 
-    if not user_input:
-        print("No user input processed")
-        return
+        print("\nYou said:", text)
 
-    llm_start = time.time()
-    plan = get_servo_plan_from_llm(user_input)
-    print("LLM time: ",time.time() - llm_start)
+        if not text:
+            print("No speech recognized.")
+            continue
 
-    pan_target = clamp(pan + plan["pan_delta_deg"], MIN_ANGLE, MAX_ANGLE)
-    tilt_target = clamp(tilt + plan["tilt_delta_deg"], MIN_ANGLE, MAX_ANGLE)
+        plan = get_servo_plan_from_llm(text, pan, tilt)
+        if not plan:
+            print("Invalid command.")
+            continue
 
-    simulate_servo_motion(
-        pan,
-        tilt,
-        pan_target,
-        tilt_target
-    )
+        mode = plan["mode"]
+        val_pan = float(plan["pan"])
+        val_tilt = float(plan["tilt"])
 
-main()
+        if mode == "delta":
+            pan_target = clamp(pan + val_pan, MIN_ANGLE, MAX_ANGLE)
+            tilt_target = clamp(tilt + val_tilt, MIN_ANGLE, MAX_ANGLE)
+
+        elif mode == "absolute":
+            pan_target = clamp(val_pan, MIN_ANGLE, MAX_ANGLE)
+            tilt_target = clamp(val_tilt, MIN_ANGLE, MAX_ANGLE)
+
+        else:
+            print("Unknown mode:", mode)
+            continue
+
+        pan, tilt = simulate_motion(pan, tilt, pan_target, tilt_target)
+
+        print("\nNew position:", pan, tilt)
+        print("\nSay another command...\n")
 
 
-
+if __name__ == "__main__":
+    main()
