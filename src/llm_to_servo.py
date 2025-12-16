@@ -27,10 +27,12 @@ from ollama import chat
 
 # MODEL_NAME = "gemma3:1b"
 # MODEL_NAME = "qwen2.5:1.5b-instruct-q4_K_M"
-MODEL_NAME = "phi3:mini"
+# MODEL_NAME = "phi3:mini"
+# MODEL_LIST = ["phi3:mini", "qwen2.5:1.5b-instruct", "phi:2.7b", "qwen3-coder:30b"]
+MODEL_LIST = ["phi3:mini"]
 
 
-WHISPER_MODEL_PATH = "ggml-tiny.en.bin"
+WHISPER_MODEL_PATH = "../models/ggml-tiny.en.bin"
 TEMP_WAV_PATH = "speech.wav"
 SAMPLE_RATE = 16000
 
@@ -126,7 +128,7 @@ def run_whisper(audio_path: str) -> str:
 
 # ---------------- LLM COMMAND PARSER -------------------
 
-def get_servo_plan_from_llm(text: str, pan: float, tilt: float) -> Optional[Dict]:
+def get_servo_plan_from_llm(text: str, pan: float, tilt: float, model_name: str) -> Optional[Dict]:
     """
     LLM converts natural language into ABSOLUTE target angles.
 
@@ -137,6 +139,8 @@ def get_servo_plan_from_llm(text: str, pan: float, tilt: float) -> Optional[Dict
     }
     """
 
+    features = {"pan", "tilt", "delay"}
+
     system_prompt = """
 You control a 2-axis servo turret with pan and tilt angles.
 
@@ -144,12 +148,14 @@ Your task:
 - Read the user's natural language command.
 - Consider the CURRENT pan and tilt angles.
 - Decide the NEXT ABSOLUTE positions for pan and tilt.
+- Decide the delay between each movement
 
 You MUST output ONLY a JSON object:
 
 {
   "pan": <number>,
-  "tilt": <number>
+  "tilt": <number>,
+  "delay": <number>
 }
 
 No other fields. No explanations. No quotes. No backticks.
@@ -157,6 +163,7 @@ No other fields. No explanations. No quotes. No backticks.
 Constraints:
 - 0 <= pan <= 180
 - 0 <= tilt <= 180
+- 0.0 <= delay <= 2.0
 - Do NOT output delta values or "mode". Only absolute final angles.
 
 Behavior guidelines (not rigid rules, but IMPORTANT):
@@ -167,28 +174,29 @@ Behavior guidelines (not rigid rules, but IMPORTANT):
 - If the user says "center" -> pan = 90, tilt = 90.
 - Do not move in a direction that would exceed 0..180.
 - Use the current angles as context for how much to move.
+- If no movement speed is asked, default to 1.0
 
 Examples:
 
 Current: pan=90, tilt=90
-User: "go a little bit to the right"
+User: "go a little bit to the right, slowly"
 Reasonable output (example):
-{"pan": 100, "tilt": 90}
+{"pan": 100, "tilt": 90, "delay": 1.8}
 
 Current: pan=45, tilt=100
 User: "a lot up"
 Reasonable output:
-{"pan": 45, "tilt": 140}
+{"pan": 45, "tilt": 140, "delay": 1}
 
 Current: pan=120, tilt=70
-User: "go a little left and down"
+User: "go a little left and down very quick"
 Reasonable output:
-{"pan": 110, "tilt": 60}
+{"pan": 110, "tilt": 60, "delay": 0.5}
 
 Remember:
 - Use the given current angles.
 - Adjust only the axes mentioned by the user.
-- Always return ONLY the final JSON object with "pan" and "tilt".
+- Always return ONLY the final JSON object with "pan", "tilt" and "delay" with no extra explanation.
 """
 
     # Give the model a very clear, simple description of the situation
@@ -196,29 +204,27 @@ Remember:
         f"Current pan angle: {pan}\n"
         f"Current tilt angle: {tilt}\n\n"
         f"User command: {text}\n\n"
-        "Return ONLY the JSON with the new absolute pan and tilt values."
+        "Return ONLY the JSON with the new absolute pan and tilt values and the delay."
     )
-
-    print("Sending text to LLM...")
 
     start_llm = time.time()
 
     response = chat(
-        model=MODEL_NAME,
+        model=model_name,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     )
 
-    print("LLM time is: ", time.time() - start_llm)
-    raw = response.message.content
-    print("LLM raw output:", raw)
+    print(f"{model_name} time is: ", time.time() - start_llm)
+    raw = extract_llm_content(response)
+    print(f"{model_name} raw output: {raw}\n")
 
     try:
         plan = extract_json(raw)
         # Minimal sanity check
-        if "pan" not in plan or "tilt" not in plan:
+        if not features.issubset(plan):
             print("LLM JSON missing keys:", plan)
             return None
         return plan
@@ -226,10 +232,36 @@ Remember:
         print("LLM output parse error:", e)
         return None
 
+def extract_llm_content(response):
+    """
+    Handles all Ollama response formats:
+    - response.message.content
+    - response["message"]["content"]
+    - response["messages"][0]["content"]
+    - response["content"]
+    """
+    if isinstance(response, dict):
+        if "message" in response and isinstance(response["message"], dict):
+            if "content" in response["message"]:
+                return response["message"]["content"]
+
+        if "messages" in response and isinstance(response["messages"], list):
+            if len(response["messages"]) > 0:
+                return response["messages"][0].get("content", "")
+
+        if "content" in response:
+            return response["content"]
+
+    # Try legacy object API
+    try:
+        return response.message.content
+    except:
+        return ""
+
 
 # ---------------- SERVO SIMULATION -------------------
 
-def simulate_motion(pan, tilt, pan_target, tilt_target):
+def simulate_motion(pan, tilt, pan_target, tilt_target, delay = 1):
     steps = max(1, SIMULATION_SECONDS)
     d_pan = (pan_target - pan) / steps
     d_tilt = (tilt_target - tilt) / steps
@@ -241,7 +273,7 @@ def simulate_motion(pan, tilt, pan_target, tilt_target):
         pan += d_pan
         tilt += d_tilt
         print(f"Pan={pan:.1f}, Tilt={tilt:.1f}")
-        time.sleep(1)
+        time.sleep(delay)
 
     return pan, tilt
 
@@ -264,15 +296,17 @@ def main():
             print("No speech recognized.")
             continue
 
-        plan = get_servo_plan_from_llm(text, pan, tilt)
-        if not plan:
-            print("Invalid or unusable LLM command.")
-            continue
+        for model in MODEL_LIST:
+            plan = get_servo_plan_from_llm(text, pan, tilt, model)
+            if not plan:
+                print("Invalid or unusable LLM command.")
+                continue
 
         pan_target = clamp(float(plan["pan"]), MIN_ANGLE, MAX_ANGLE)
         tilt_target = clamp(float(plan["tilt"]), MIN_ANGLE, MAX_ANGLE)
+        delay = plan["delay"]
 
-        pan, tilt = simulate_motion(pan, tilt, pan_target, tilt_target)
+        pan, tilt = simulate_motion(pan, tilt, pan_target, tilt_target, delay)
 
         print("\nNew position:", pan, tilt)
         print("\nSay another command...\n")
