@@ -215,3 +215,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 models/
+
+models/ggml-tiny.en.bin
+models/ggml-base.en.bin
+
+speech.wav
+speech.wav.txt
