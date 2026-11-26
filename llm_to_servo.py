@@ -2,8 +2,9 @@
 Simple demo: control 2 simulated servos(pan,tilt) with a local LLM.
 
 REQUIREMENT:
-    pip install ollama
-    ollama pull gemma3
+    pip install -r requirements.txt
+    download vosk-model-small-en-us-0.15 into models/ (see README)
+    ollama pull gemma3:1b
     ollama serve
 """
 import time
@@ -80,7 +81,7 @@ def get_servo_plan_from_llm(user_instructions: str) -> Optional[Dict]:
         "Format exactly:\n"
         "{\n"
         '   "pan_delta_deg": <number>,\n'
-        '   "tilt_delta_deg": <number>,\n'
+        '   "tilt_delta_deg": <number>\n'
         "}\n\n"
         "Meaning:\n"
         " - pan_delta_deg: positive = move right, negative = move left.\n"
@@ -208,6 +209,10 @@ def main() -> None:
     plan = get_servo_plan_from_llm(user_input)
     print("LLM time: ",time.time() - llm_start)
 
+    if plan is None:
+        print("No valid plan from the LLM, not moving")
+        return
+
     pan_target = clamp(pan + plan["pan_delta_deg"], MIN_ANGLE, MAX_ANGLE)
     tilt_target = clamp(tilt + plan["tilt_delta_deg"], MIN_ANGLE, MAX_ANGLE)
 
@@ -218,7 +223,8 @@ def main() -> None:
         tilt_target
     )
 
-main()
+if __name__ == "__main__":
+    main()
 
 
 
